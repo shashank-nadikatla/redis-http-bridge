@@ -1,0 +1,7 @@
+redis-bridge
+*.test
+*.out
+coverage.out
+.idea/
+.vscode/
+.DS_Store

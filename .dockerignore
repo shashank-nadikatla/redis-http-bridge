@@ -1,0 +1,12 @@
+.git
+.gitignore
+.dockerignore
+.idea
+.vscode
+.DS_Store
+*.md
+review.md
+redis-bridge
+*.test
+*.out
+coverage.out
