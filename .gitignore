@@ -4,4 +4,5 @@ redis-bridge
 coverage.out
 .idea/
 .vscode/
+.cursor/
 .DS_Store

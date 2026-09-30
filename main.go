@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,6 +28,7 @@ const (
 	// Must comfortably exceed the per-op redis timeouts below so any in-flight
 	// command on the evicted pool can finish before its sockets are torn down.
 	evictedCloseDelay = 30 * time.Second
+	redisOpTimeout    = 6 * time.Second
 )
 
 type ErrorResponse struct {
@@ -95,6 +98,18 @@ func (c *clientCache) getOrPut(key string, newClient *redis.Client) (canonical, 
 	return newClient, nil
 }
 
+func (c *clientCache) invalidate(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.items[key]
+	if !ok {
+		return
+	}
+	c.ll.Remove(el)
+	delete(c.items, key)
+	_ = el.Value.(*clientCacheEntry).client.Close()
+}
+
 func (c *clientCache) closeAll() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -109,6 +124,25 @@ type Server struct {
 	addr        string
 	maxBodySize int64
 	cache       *clientCache
+}
+
+func isConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "no route to host") ||
+		strings.Contains(s, "network is unreachable") ||
+		strings.Contains(s, "failed to dial")
 }
 
 func newServer() *Server {
@@ -139,9 +173,13 @@ func (s *Server) getClient(redisURL string) (*redis.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid redis url: %v", err)
 	}
-	opts.DialTimeout = 5 * time.Second
-	opts.ReadTimeout = 5 * time.Second
-	opts.WriteTimeout = 5 * time.Second
+	opts.DialTimeout = 2 * time.Second
+	opts.ReadTimeout = 2 * time.Second
+	opts.WriteTimeout = 2 * time.Second
+	opts.PoolTimeout = 3 * time.Second
+	opts.MaxRetries = 0
+	opts.MinRetryBackoff = 100 * time.Millisecond
+	opts.MaxRetryBackoff = 300 * time.Millisecond
 	c := redis.NewClient(opts)
 
 	canonical, displaced := s.cache.getOrPut(redisURL, c)
@@ -168,9 +206,22 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, ErrorResponse{Error: msg})
 }
 
-func (s *Server) redisErr(w http.ResponseWriter, op, key string, err error) {
-	fmt.Fprintf(os.Stderr, "ERROR redis op=%s key=%s err=%v\n", op, key, err)
-	writeError(w, http.StatusServiceUnavailable, "redis error")
+func (s *Server) redisErr(w http.ResponseWriter, redisURL, op, key string, err error) {
+	evicted := false
+	if isConnErr(err) {
+		s.cache.invalidate(redisURL)
+		evicted = true
+	}
+	fmt.Fprintf(os.Stderr, "ERROR redis op=%s key=%s err=%v evicted=%v\n", op, key, err, evicted)
+	msg := "redis error"
+	if isConnErr(err) {
+		msg = "redis unreachable: VPN may not route to this host (run: timeout 5 nc -zv <redis-host> 6379)"
+	}
+	writeError(w, http.StatusServiceUnavailable, msg)
+}
+
+func (s *Server) redisCtx(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), redisOpTimeout)
 }
 
 func parseTTL(r *http.Request) (time.Duration, error) {
@@ -185,23 +236,23 @@ func parseTTL(r *http.Request) (time.Duration, error) {
 	return time.Duration(secs) * time.Second, nil
 }
 
-func (s *Server) prep(w http.ResponseWriter, r *http.Request) (*redis.Client, string, bool) {
+func (s *Server) prep(w http.ResponseWriter, r *http.Request) (*redis.Client, string, string, bool) {
 	redisURL := r.URL.Query().Get("url")
 	if redisURL == "" {
 		writeError(w, http.StatusBadRequest, "url query param is required (e.g. redis://host:6379)")
-		return nil, "", false
+		return nil, "", "", false
 	}
 	key := r.URL.Query().Get("key")
 	if key == "" {
 		writeError(w, http.StatusBadRequest, "key query param is required")
-		return nil, "", false
+		return nil, "", "", false
 	}
 	c, err := s.getClient(redisURL)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
-		return nil, "", false
+		return nil, "", "", false
 	}
-	return c, key, true
+	return c, key, redisURL, true
 }
 
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
@@ -227,7 +278,7 @@ func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool)
 }
 
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
-	client, key, ok := s.prep(w, r)
+	client, key, redisURL, ok := s.prep(w, r)
 	if !ok {
 		return
 	}
@@ -241,10 +292,12 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := s.redisCtx(r)
+	defer cancel()
 	// Atomic set-if-not-exists; one round trip, no TOCTOU race.
-	created, err := client.SetNX(r.Context(), key, body, ttl).Result()
+	created, err := client.SetNX(ctx, key, body, ttl).Result()
 	if err != nil {
-		s.redisErr(w, "SETNX", key, err)
+		s.redisErr(w, redisURL, "SETNX", key, err)
 		return
 	}
 	if !created {
@@ -255,12 +308,13 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
-	client, key, ok := s.prep(w, r)
+	client, key, redisURL, ok := s.prep(w, r)
 	if !ok {
 		return
 	}
 
-	ctx := r.Context()
+	ctx, cancel := s.redisCtx(r)
+	defer cancel()
 	// GET + TTL in a single round trip.
 	pipe := client.Pipeline()
 	getCmd := pipe.Get(ctx, key)
@@ -273,7 +327,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.redisErr(w, "GET", key, err)
+		s.redisErr(w, redisURL, "GET", key, err)
 		return
 	}
 
@@ -290,7 +344,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
-	client, key, ok := s.prep(w, r)
+	client, key, redisURL, ok := s.prep(w, r)
 	if !ok {
 		return
 	}
@@ -304,10 +358,12 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := s.redisCtx(r)
+	defer cancel()
 	// Atomic set-if-exists; one round trip, no TOCTOU race.
-	updated, err := client.SetXX(r.Context(), key, body, ttl).Result()
+	updated, err := client.SetXX(ctx, key, body, ttl).Result()
 	if err != nil {
-		s.redisErr(w, "SETXX", key, err)
+		s.redisErr(w, redisURL, "SETXX", key, err)
 		return
 	}
 	if !updated {
@@ -318,7 +374,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePatchTTL(w http.ResponseWriter, r *http.Request) {
-	client, key, ok := s.prep(w, r)
+	client, key, redisURL, ok := s.prep(w, r)
 	if !ok {
 		return
 	}
@@ -332,10 +388,12 @@ func (s *Server) handlePatchTTL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := s.redisCtx(r)
+	defer cancel()
 	// EXPIRE returns false iff the key does not exist; one round trip.
-	got, err := client.Expire(r.Context(), key, ttl).Result()
+	got, err := client.Expire(ctx, key, ttl).Result()
 	if err != nil {
-		s.redisErr(w, "EXPIRE", key, err)
+		s.redisErr(w, redisURL, "EXPIRE", key, err)
 		return
 	}
 	if !got {
@@ -346,15 +404,17 @@ func (s *Server) handlePatchTTL(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
-	client, key, ok := s.prep(w, r)
+	client, key, redisURL, ok := s.prep(w, r)
 	if !ok {
 		return
 	}
 
+	ctx, cancel := s.redisCtx(r)
+	defer cancel()
 	// DEL returns number of keys removed; one round trip.
-	n, err := client.Del(r.Context(), key).Result()
+	n, err := client.Del(ctx, key).Result()
 	if err != nil {
-		s.redisErr(w, "DEL", key, err)
+		s.redisErr(w, redisURL, "DEL", key, err)
 		return
 	}
 	if n == 0 {

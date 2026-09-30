@@ -8,10 +8,34 @@ A ~2 MB Docker image (UPX-compressed scratch binary) that bridges HTTP to Redis.
 
 ```bash
 docker build -t redis-bridge:v1 .
-docker run -d -p 127.0.0.1:8087:8087 --restart=always --name redis-bridge-c redis-bridge:v1
+docker run -d --network host --restart=always --name redis-bridge-c redis-bridge:v1
 ```
 
 Always available at `http://localhost:8087`.
+
+> Use `--network host` so the bridge shares your host VPN routes (required for private ElastiCache endpoints). Bridge port mapping (`-p 8087:8087`) can break VPN reachability on some setups.
+
+> Your curl must include the full URL, e.g. `http://localhost:8087/redis?url=...&key=...` — not just `/redis?url=...`.
+
+### VPN / private Redis troubleshooting
+
+Private ElastiCache endpoints are only reachable when your host VPN routes to them. The bridge uses `--network host` so it shares those routes.
+
+1. Connect the VPN profile that can reach your Redis VPC.
+2. Verify TCP from the host (always use `timeout` — bare `nc` hangs on blackholed connections):
+   ```bash
+   timeout 5 nc -zv YOUR_REDIS_HOST 6379
+   ```
+3. After switching VPN, restart the bridge to drop stale connection pools:
+   ```bash
+   docker restart redis-bridge-c
+   ```
+4. Query via bridge (full URL required):
+   ```bash
+   curl 'http://localhost:8087/redis?url=YOUR_ENCODED_REDIS_URL&key=YOUR_KEY'
+   ```
+
+If step 2 times out, the bridge will return `503` with a connectivity hint within ~6 seconds — fix VPN/security-group access first; the bridge cannot bypass network blocks.
 
 ### Run without Docker
 
@@ -133,7 +157,7 @@ Standard Redis URL: `redis://[username:password@]host:port[/db]`. TLS via `redis
 
 ## Logs
 
-Logs go to stderr with leveled prefixes (`INFO`/`ERROR`). Each request emits one line with `method`, `path`, `key`, `status`, and `dur`. Redis-side failures emit a separate `ERROR` line with `op`, `key`, and the underlying error.
+Logs go to stderr with `INFO`/`ERROR` prefixes: startup/shutdown lifecycle events and Redis-side failures (`op`, `key`, underlying error).
 
 ```bash
 docker logs -f redis-bridge-c
